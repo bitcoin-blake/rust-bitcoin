@@ -1858,6 +1858,7 @@ mod tests {
             time: 1599332177,
             bits: epoch_start.bits,
             nonce: epoch_start.nonce,
+            v2: None,
         };
         let adjustment =
             CompactTarget::from_header_difficulty_adjustment(epoch_start, current, params);
@@ -1881,6 +1882,7 @@ mod tests {
             time: 1599332844,
             bits: starting_bits,
             nonce: 0,
+            v2: None,
         };
         // Block 4031, the only information used are `bits` and `time`
         let current = Header {
@@ -1890,6 +1892,7 @@ mod tests {
             time: 1600591200,
             bits: starting_bits,
             nonce: 0,
+            v2: None,
         };
         let adjustment =
             CompactTarget::from_header_difficulty_adjustment(epoch_start, current, params);

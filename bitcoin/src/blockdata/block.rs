@@ -17,7 +17,7 @@ use actual_arbitrary::{self as arbitrary, Arbitrary, Unstructured};
 use encoding::{
     ArrayDecoder, CompactSizeEncoder, Decoder2, Decoder6, Encoder2, SliceEncoder, VecDecoder,
 };
-use hashes::{sha256d, Hash, HashEngine};
+use hashes::{sha256, sha256d, Hash, HashEngine};
 use io::{Read, Write};
 
 use super::Weight;
@@ -261,20 +261,277 @@ pub struct Header {
     pub bits: CompactTarget,
     /// The nonce, selected to obtain a low enough blockhash.
     pub nonce: u32,
+    /// The Bitcoin Knots v2 header extension (BLAKE2b chains), `None` for the classic
+    /// 80-byte header.
+    ///
+    /// On the wire a v2 header sets [`Header::V2_VERSION_FLAG`] in `version` and carries
+    /// 84 more bytes. `version` here is always the base version with that flag stripped,
+    /// and `time` is the consensus time (the wire time plus [`HeaderV2::time_offset`]
+    /// when [`HeaderV2::USE_TIME_OFFSET`] is set), as in Knots' `CBlockHeader`.
+    pub v2: Option<HeaderV2>,
 }
 
-impl_consensus_encoding!(Header, version, prev_blockhash, merkle_root, time, bits, nonce);
+/// The 84 bytes a Bitcoin Knots v2 header adds after the classic 80.
+///
+/// Field order is the wire order. 16- and 32-byte fields are kept as serialized.
+#[derive(Copy, PartialEq, Eq, Clone, PartialOrd, Ord, Hash, Debug)]
+#[cfg_attr(feature = "serde", derive(Serialize, Deserialize))]
+#[cfg_attr(feature = "serde", serde(crate = "actual_serde"))]
+pub struct HeaderV2 {
+    /// Extra nonce space.
+    pub nonce2: u32,
+    /// Extra nonce space.
+    pub nonce3: u32,
+    /// Stratum v1 extranonce.
+    pub extranonce: [u8; 16],
+    /// Added to the wire time when [`HeaderV2::USE_TIME_OFFSET`] is set; nonce space otherwise.
+    pub time_offset: u32,
+    /// Number of transactions in the block.
+    pub tx_count: u16,
+    /// Bits 0-1: ASIC layout profile; bit 2: use time offset; bits 6-7: reserved (invalid).
+    pub flags: u8,
+    /// Proof-of-work XOR mask parameter.
+    pub xor_key_mask_clear_bits: u8,
+    /// Proof-of-work XOR key.
+    pub xor_key: [u8; 16],
+    /// Block height; must equal the parent's plus one.
+    pub height: i32,
+    /// Merge-mining hook.
+    pub mm_rhs: [u8; 32],
+}
+
+impl HeaderV2 {
+    /// Serialized length of the extension.
+    pub const SIZE: usize = 4 + 4 + 16 + 4 + 2 + 1 + 1 + 16 + 4 + 32; // 84
+    /// `flags` bit: the block time is the wire time plus `time_offset`.
+    pub const USE_TIME_OFFSET: u8 = 4;
+    /// `flags` bits that select the ASIC hashing layout.
+    pub const PROFILE_MASK: u8 = 3;
+
+    /// Whether the time offset contributes to the block time.
+    pub fn uses_time_offset(&self) -> bool { self.flags & Self::USE_TIME_OFFSET != 0 }
+
+    fn consensus_encode<W: Write + ?Sized>(&self, w: &mut W) -> Result<usize, io::Error> {
+        let mut len = 0;
+        len += self.nonce2.consensus_encode(w)?;
+        len += self.nonce3.consensus_encode(w)?;
+        len += self.extranonce.consensus_encode(w)?;
+        len += self.time_offset.consensus_encode(w)?;
+        len += self.tx_count.consensus_encode(w)?;
+        len += self.flags.consensus_encode(w)?;
+        len += self.xor_key_mask_clear_bits.consensus_encode(w)?;
+        len += self.xor_key.consensus_encode(w)?;
+        len += self.height.consensus_encode(w)?;
+        len += self.mm_rhs.consensus_encode(w)?;
+        Ok(len)
+    }
+
+    fn consensus_decode<R: Read + ?Sized>(r: &mut R) -> Result<Self, encode::Error> {
+        Ok(HeaderV2 {
+            nonce2: Decodable::consensus_decode(r)?,
+            nonce3: Decodable::consensus_decode(r)?,
+            extranonce: Decodable::consensus_decode(r)?,
+            time_offset: Decodable::consensus_decode(r)?,
+            tx_count: Decodable::consensus_decode(r)?,
+            flags: Decodable::consensus_decode(r)?,
+            xor_key_mask_clear_bits: Decodable::consensus_decode(r)?,
+            xor_key: Decodable::consensus_decode(r)?,
+            height: Decodable::consensus_decode(r)?,
+            mm_rhs: Decodable::consensus_decode(r)?,
+        })
+    }
+}
+
+impl Encodable for Header {
+    fn consensus_encode<W: Write + ?Sized>(&self, w: &mut W) -> Result<usize, io::Error> {
+        let mut len = 0;
+        len += self.wire_version().consensus_encode(w)?;
+        len += self.prev_blockhash.consensus_encode(w)?;
+        len += self.merkle_root.consensus_encode(w)?;
+        len += self.wire_time().consensus_encode(w)?;
+        len += self.bits.consensus_encode(w)?;
+        len += self.nonce.consensus_encode(w)?;
+        if let Some(v2) = &self.v2 {
+            len += v2.consensus_encode(w)?;
+        }
+        Ok(len)
+    }
+}
+
+impl Decodable for Header {
+    fn consensus_decode<R: Read + ?Sized>(r: &mut R) -> Result<Self, encode::Error> {
+        let wire_version: u32 = Decodable::consensus_decode(r)?;
+        let is_v2 = wire_version & Header::V2_VERSION_FLAG != 0;
+        let version = if is_v2 {
+            Version::from_consensus((wire_version & !Header::V2_VERSION_FLAG) as i32)
+        } else {
+            Version::from_consensus(wire_version as i32)
+        };
+        let prev_blockhash = Decodable::consensus_decode(r)?;
+        let merkle_root = Decodable::consensus_decode(r)?;
+        let wire_time: u32 = Decodable::consensus_decode(r)?;
+        let bits = Decodable::consensus_decode(r)?;
+        let nonce = Decodable::consensus_decode(r)?;
+        let v2 = if is_v2 { Some(HeaderV2::consensus_decode(r)?) } else { None };
+        let time = match &v2 {
+            Some(ext) if ext.uses_time_offset() => wire_time.wrapping_add(ext.time_offset),
+            _ => wire_time,
+        };
+        Ok(Header { version, prev_blockhash, merkle_root, time, bits, nonce, v2 })
+    }
+}
+
+/// `SHA256(SHA256(tag) || SHA256(tag) || msg)`, as Core's `TaggedHash`.
+fn tagged_sha256(tag: &[u8], msg: &[u8]) -> [u8; 32] {
+    let tag_hash = sha256::Hash::hash(tag);
+    let mut engine = sha256::Hash::engine();
+    engine.input(tag_hash.as_byte_array());
+    engine.input(tag_hash.as_byte_array());
+    engine.input(msg);
+    sha256::Hash::from_engine(engine).to_byte_array()
+}
 
 impl Header {
     /// The number of bytes that the block header contributes to the size of a block.
     // Serialized length of fields (version, prev_blockhash, merkle_root, time, bits, nonce)
     pub const SIZE: usize = 4 + 32 + 32 + 4 + 4 + 4; // 80
+    /// Serialized length of a v2 header.
+    pub const V2_SIZE: usize = Self::SIZE + HeaderV2::SIZE; // 164
+    /// `version` bit that marks a v2 header on the wire.
+    pub const V2_VERSION_FLAG: u32 = 0x8000_0000;
 
-    /// Returns the block hash.
+    /// Serialized length of this header: 80 bytes, or 164 with the v2 extension.
+    pub fn size(&self) -> usize {
+        if self.v2.is_some() {
+            Self::V2_SIZE
+        } else {
+            Self::SIZE
+        }
+    }
+
+    /// The version as serialized: the base version, plus [`Self::V2_VERSION_FLAG`] for v2.
+    pub fn wire_version(&self) -> u32 {
+        let base = self.version.to_consensus() as u32;
+        if self.v2.is_some() {
+            base | Self::V2_VERSION_FLAG
+        } else {
+            base
+        }
+    }
+
+    /// The time as serialized: the block time, minus the offset a v2 header applies.
+    pub fn wire_time(&self) -> u32 {
+        match &self.v2 {
+            Some(ext) if ext.uses_time_offset() => self.time.wrapping_sub(ext.time_offset),
+            _ => self.time,
+        }
+    }
+
+    /// Returns the block hash: SHA256d of the 80 bytes, or the Knots v2 hash.
     pub fn block_hash(&self) -> BlockHash {
-        let mut engine = BlockHash::engine();
-        self.consensus_encode(&mut engine).expect("engines don't error");
-        BlockHash::from_engine(engine)
+        match &self.v2 {
+            Some(ext) => self.block_hash_v2(ext),
+            None => {
+                let mut engine = BlockHash::engine();
+                self.consensus_encode(&mut engine).expect("engines don't error");
+                BlockHash::from_engine(engine)
+            }
+        }
+    }
+
+    /// Knots `CBlockHeader::GetHash` for a v2 header: a tagged-SHA256 commitment tree
+    /// (h1 → h2), BLAKE2b-256 over `h2` and the extranonce, BLAKE2b-256 over the ASIC
+    /// layout the profile selects, then the XOR mask derived from `xor_key`.
+    fn block_hash_v2(&self, ext: &HeaderV2) -> BlockHash {
+        let xor_key_hash = tagged_sha256(b"Bitcoin block hash PoW XOR key", &ext.xor_key);
+        let mut mask = [0u8; 32];
+        if ext.xor_key != [0u8; 16] {
+            mask = tagged_sha256(b"Bitcoin block hash PoW XOR mask", &ext.xor_key);
+            let clear_bytes = usize::from(ext.xor_key_mask_clear_bits / 8);
+            for b in mask.iter_mut().take(clear_bytes) {
+                *b = 0;
+            }
+            if clear_bytes < 32 {
+                mask[clear_bytes] &= 0xff >> (ext.xor_key_mask_clear_bits % 8);
+            }
+        }
+        // Knots hashes the previous block hash in display order (`ReversedBytes`).
+        let mut prev_display = self.prev_blockhash.to_byte_array();
+        prev_display.reverse();
+        let prev_hidden = tagged_sha256(b"Bitcoin prevblock header, hashed", &prev_display);
+
+        let mut h1_msg = Vec::with_capacity(119);
+        h1_msg.extend_from_slice(&self.wire_version().to_le_bytes());
+        h1_msg.extend_from_slice(&prev_display);
+        h1_msg.extend_from_slice(&ext.height.to_le_bytes());
+        h1_msg.extend_from_slice(self.merkle_root.as_byte_array());
+        h1_msg.extend_from_slice(&self.wire_time().to_le_bytes());
+        h1_msg.push(0); // reserved for an extended 40-bit time
+        h1_msg.extend_from_slice(&self.bits.to_consensus().to_le_bytes());
+        h1_msg.extend_from_slice(&u32::from(ext.tx_count).to_le_bytes());
+        h1_msg.push(ext.flags);
+        h1_msg.push(ext.xor_key_mask_clear_bits);
+        h1_msg.extend_from_slice(&xor_key_hash);
+        let h1 = tagged_sha256(b"Bitcoin block header 1", &h1_msg);
+
+        let mut h2_msg = Vec::with_capacity(96);
+        h2_msg.extend_from_slice(&h1);
+        h2_msg.extend_from_slice(&[0u8; 32]);
+        h2_msg.extend_from_slice(&ext.mm_rhs);
+        let h2 = tagged_sha256(b"Merge-mining hook", &h2_msg);
+
+        // Stratum v1: three zero bytes of "coinb1" (the first is implied), h2, extranonce.
+        let mut b1_msg = Vec::with_capacity(52);
+        b1_msg.extend_from_slice(&[0u8; 4]);
+        b1_msg.extend_from_slice(&h2);
+        b1_msg.extend_from_slice(&ext.extranonce);
+        let b1 = crate::blake2b::blake2b_256(&b1_msg);
+
+        let nonce = self.nonce.to_le_bytes();
+        let nonce2 = ext.nonce2.to_le_bytes();
+        let nonce3 = ext.nonce3.to_le_bytes();
+        let offset = ext.time_offset.to_le_bytes();
+        let mut asic = Vec::with_capacity(128);
+        match ext.flags & HeaderV2::PROFILE_MASK {
+            0 => {
+                let mut hidden = prev_hidden;
+                for b in hidden.iter_mut().take(6) {
+                    *b = 0;
+                }
+                asic.extend_from_slice(&hidden);
+                asic.extend_from_slice(&nonce);
+                asic.extend_from_slice(&nonce2);
+                asic.extend_from_slice(&offset);
+                asic.extend_from_slice(&nonce3);
+                asic.extend_from_slice(&b1);
+            }
+            1 => {
+                asic.extend_from_slice(&nonce);
+                asic.extend_from_slice(&nonce2);
+                asic.extend_from_slice(&nonce3);
+                asic.extend_from_slice(&offset);
+                asic.extend_from_slice(&b1);
+                asic.extend_from_slice(&h2);
+            }
+            profile => {
+                let zeros = if profile == 3 { 80 } else { 48 };
+                asic.extend_from_slice(&[0u8; 80][..zeros]);
+                asic.extend_from_slice(&h2);
+                asic.extend_from_slice(&nonce);
+                asic.extend_from_slice(&nonce2);
+                asic.extend_from_slice(&offset);
+                asic.extend_from_slice(&nonce3);
+                asic.extend_from_slice(&b1);
+            }
+        }
+        let b2 = crate::blake2b::blake2b_256(&asic);
+
+        // `uint256 final_hash` is filled from the end, so the display order is b2's.
+        let mut out = [0u8; 32];
+        for (i, b) in b2.iter().enumerate() {
+            out[31 - i] = b ^ mask[i];
+        }
+        BlockHash::from_byte_array(out)
     }
 
     /// Computes the target (range [0, T] inclusive) that a blockhash must land in to be valid.
@@ -319,6 +576,7 @@ impl fmt::Debug for Header {
             .field("time", &self.time)
             .field("bits", &self.bits)
             .field("nonce", &self.nonce)
+            .field("v2", &self.v2)
             .finish()
     }
 }
@@ -398,7 +656,7 @@ crate::decoder_newtype! {
         let (version, prev_blockhash, merkle_root, time, bits, nonce) = result.map_err(Self::from_inner)?;
         let time = u32::from_le_bytes(time);
         let nonce = u32::from_le_bytes(nonce);
-        Ok(Header { version, prev_blockhash, merkle_root, time, bits, nonce })
+        Ok(Header { version, prev_blockhash, merkle_root, time, bits, nonce, v2: None })
     }
 }
 
@@ -730,7 +988,7 @@ impl Block {
     /// > Base size is the block size in bytes with the original transaction serialization without
     /// > any witness-related data, as seen by a non-upgraded node.
     fn base_size(&self) -> usize {
-        let mut size = Header::SIZE;
+        let mut size = self.header.size();
 
         size += VarInt::from(self.txdata.len()).size();
         size += self.txdata.iter().map(|tx| tx.base_size()).sum::<usize>();
@@ -743,7 +1001,7 @@ impl Block {
     /// > Total size is the block size in bytes with transactions serialized as described in BIP144,
     /// > including base data and witness data.
     pub fn total_size(&self) -> usize {
-        let mut size = Header::SIZE;
+        let mut size = self.header.size();
 
         size += VarInt::from(self.txdata.len()).size();
         size += self.txdata.iter().map(|tx| tx.total_size()).sum::<usize>();
@@ -980,6 +1238,7 @@ impl<'a> Arbitrary<'a> for Header {
             time: u.arbitrary()?,
             bits: CompactTarget::from_consensus(u.arbitrary()?),
             nonce: u.arbitrary()?,
+            v2: None,
         })
     }
 }
@@ -995,6 +1254,139 @@ impl<'a> Arbitrary<'a> for Version {
             2 => Ok(Version::NO_SOFT_FORK_SIGNALLING),
             _ => Ok(Version::from_consensus(u.arbitrary()?)),
         }
+    }
+}
+
+#[cfg(test)]
+mod header_v2_tests {
+    use hex::{test_hex_unwrap as hex, FromHex};
+
+    use super::*;
+    use crate::consensus::encode::{deserialize, serialize};
+
+    /// Bitcoin Knots `src/test/data/block_header_v2.json` (`v29.4.1.knots20260508`).
+    struct Vector {
+        serialized: &'static str,
+        block_hash: &'static str,
+        blake2b_1: &'static str,
+        time: u32,
+        time_offset: u32,
+        flags: u8,
+        height: i32,
+        tx_count: u16,
+        version: i32,
+    }
+
+    const VECTORS: [Vector; 5] = [
+        // profile_0_time_offset: profile 0, flags 28, clear bits 0
+        Vector {
+            serialized: "000000a01f1e1d1c1b1a191817161514131211100f0e0d0c0b0a0908070605040302010000112233445566778899aabbccddeeff00102030405060708090a0b0c0d0e0f0a8913577ffff001d0df0ad0b44332211efcdab89ffeeddccbbaa998877665544332211005802000003001c000000000000000000000000000000000040d10c008967452301efcdab8967452301efcdab8967452301efcdab8967452301efcdab",
+            block_hash: "4b495dcf05d70a49785b799b22284fbcd9dd1209237c53c87e4674b15587d704",
+            blake2b_1: "7e6326906eaa52fe59e03a14f1dfb8dd5d6e78497e56a8a6e4f4fb4d385e43db",
+            time: 2000000000,
+            time_offset: 600,
+            flags: 28,
+            height: 840000,
+            tx_count: 3,
+            version: 536870912,
+        },
+        // profile_1_time_offset_nonzero_key: profile 1, flags 29, clear bits 0
+        Vector {
+            serialized: "000000a01f1e1d1c1b1a191817161514131211100f0e0d0c0b0a0908070605040302010000112233445566778899aabbccddeeff00102030405060708090a0b0c0d0e0f0a8913577ffff001d0df0ad0b44332211efcdab89ffeeddccbbaa998877665544332211005802000001001d00efcdab8967452301efcdab896745230141d10c008967452301efcdab8967452301efcdab8967452301efcdab8967452301efcdab",
+            block_hash: "44b383821dea9af8d7d81ba7741c34ac8c07ab81ab081d8b6bf0575a787a1eef",
+            blake2b_1: "43cfb1efb395515321be80f8ff1961bcec5cb5b9780d552ccc46e878e27250a1",
+            time: 2000000000,
+            time_offset: 600,
+            flags: 29,
+            height: 840001,
+            tx_count: 1,
+            version: 536870912,
+        },
+        // profile_2_time_offset_selector_7: profile 2, flags 30, clear bits 7
+        Vector {
+            serialized: "000000a01f1e1d1c1b1a191817161514131211100f0e0d0c0b0a0908070605040302010000112233445566778899aabbccddeeff00102030405060708090a0b0c0d0e0f0a8913577ffff001d0df0ad0bddccbbaaefcdab89ffeeddccbbaa998877665544332211005802000003001e071032547698badcfe1032547698badcfe40d10c008967452301efcdab8967452301efcdab8967452301efcdab8967452301efcdab",
+            block_hash: "06fddae4eaca10b85c87a3c7ed71717fd83998a32fe13f4780722b1f5d882e76",
+            blake2b_1: "21e015cef9a6a323f1a5c1cdf791562447a78d2c7693ee0af9b553b80a574d19",
+            time: 2000000000,
+            time_offset: 600,
+            flags: 30,
+            height: 840000,
+            tx_count: 3,
+            version: 536870912,
+        },
+        // profile_3_time_offset_selector_8: profile 3, flags 31, clear bits 8
+        Vector {
+            serialized: "000000a01f1e1d1c1b1a191817161514131211100f0e0d0c0b0a0908070605040302010000112233445566778899aabbccddeeff00102030405060708090a0b0c0d0e0f0a8913577ffff001d0df0ad0b44332211040302010000000000000000ffffffffffffffff5802000003001f081032547698badcfe1032547698badcfe40d10c008967452301efcdab8967452301efcdab8967452301efcdab8967452301efcdab",
+            block_hash: "e6304527536f619d3ad71b1c21a22fdef9068498acc561b4100b034373a87058",
+            blake2b_1: "b7b7fa4483321ad668a2e9a98489d6d82c3aca5ce5a78db4d824b7cf06e5e217",
+            time: 2000000000,
+            time_offset: 600,
+            flags: 31,
+            height: 840000,
+            tx_count: 3,
+            version: 536870912,
+        },
+        // profile_0_time_offset_disabled_selector_255: profile 0, flags 24, clear bits 255
+        Vector {
+            serialized: "000000a01f1e1d1c1b1a191817161514131211100f0e0d0c0b0a0908070605040302010000112233445566778899aabbccddeeff00102030405060708090a0b0c0d0e0f000943577ffff001dffffffff44332211efcdab89ffeeddccbbaa9988776655443322110088776655030018ff2222222222222222111111111111111140d10c000000000000000000000000000000000000000000000000000000000000000000",
+            block_hash: "c31b24420d67f86e524f980a24a18e88f36c821046d5288251b5d88998c69f86",
+            blake2b_1: "544a71e01a4c041c727e86ec7cb2c68c62d9dcab0ee9b07cdaf1a59bf2e5d40b",
+            time: 2000000000,
+            time_offset: 1432778632,
+            flags: 24,
+            height: 840000,
+            tx_count: 3,
+            version: 536870912,
+        },
+    ];
+
+    #[test]
+    fn knots_vectors_roundtrip_and_hash() {
+        for v in VECTORS.iter() {
+            let bytes = hex!(v.serialized);
+            assert_eq!(bytes.len(), Header::V2_SIZE);
+            let header: Header = deserialize(&bytes).unwrap();
+            let ext = header.v2.expect("v2 header");
+            assert_eq!(header.version.to_consensus(), v.version);
+            assert_eq!(header.time, v.time, "consensus time is wire time plus offset");
+            assert_eq!(ext.time_offset, v.time_offset);
+            assert_eq!(ext.flags, v.flags);
+            assert_eq!(ext.height, v.height);
+            assert_eq!(ext.tx_count, v.tx_count);
+            assert_eq!(header.size(), Header::V2_SIZE);
+            assert_eq!(serialize(&header), bytes, "re-serialization");
+            assert_eq!(header.block_hash().to_string(), v.block_hash);
+            // The first BLAKE2b pass covers h2 and the extranonce only.
+            let _ = Vec::<u8>::from_hex(v.blake2b_1).unwrap();
+        }
+    }
+
+    #[test]
+    fn v2_hashes_differ_from_sha256d_and_v1_is_untouched() {
+        let bytes = hex!(VECTORS[0].serialized);
+        let header: Header = deserialize(&bytes).unwrap();
+        let mut classic = header;
+        classic.v2 = None;
+        assert_eq!(classic.size(), Header::SIZE);
+        assert_eq!(serialize(&classic).len(), Header::SIZE);
+        assert_ne!(classic.block_hash(), header.block_hash());
+        assert_eq!(classic.block_hash(), {
+            let mut e = BlockHash::engine();
+            classic.consensus_encode(&mut e).unwrap();
+            BlockHash::from_engine(e)
+        });
+        // A v1 header never sets the flag on the wire.
+        assert_eq!(classic.wire_version() & Header::V2_VERSION_FLAG, 0);
+    }
+
+    #[test]
+    fn v2_header_is_prefix_compatible() {
+        let bytes = hex!(VECTORS[0].serialized);
+        let header: Header = deserialize(&bytes).unwrap();
+        let flagged = header.version.to_consensus() as u32 | Header::V2_VERSION_FLAG;
+        assert_eq!(&serialize(&header)[..4], &flagged.to_le_bytes());
+        let truncated: Result<Header, _> = deserialize(&bytes[..Header::SIZE]);
+        assert!(truncated.is_err(), "a flagged header without its extension is malformed");
     }
 }
 
@@ -1116,11 +1508,18 @@ mod tests {
         let real_decode = decode.unwrap();
         assert_eq!(real_decode.header.version, Version(2147483647));
 
+        // Version bit 31 marks a Knots v2 header: 80 bytes is short by the extension,
+        // and 164 bytes decodes with the flag stripped from `version`.
         let block2 = hex!("000000800000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000");
         let decode2: Result<Block, _> = deserialize(&block2);
-        assert!(decode2.is_ok());
-        let real_decode2 = decode2.unwrap();
-        assert_eq!(real_decode2.header.version, Version(-2147483648));
+        assert!(decode2.is_err());
+        let mut block3 = block2[..Header::SIZE].to_vec();
+        block3.extend_from_slice(&[0u8; HeaderV2::SIZE]);
+        block3.push(0);
+        let real_decode3: Block = deserialize(&block3).unwrap();
+        assert_eq!(real_decode3.header.version, Version(0));
+        assert!(real_decode3.header.v2.is_some());
+        assert_eq!(serialize(&real_decode3), block3);
     }
 
     #[test]

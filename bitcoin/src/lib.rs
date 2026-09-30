@@ -103,6 +103,7 @@ mod serde_utils;
 pub mod p2p;
 pub mod address;
 pub mod bip152;
+pub mod blake2b;
 pub mod bip158;
 pub mod bip32;
 pub mod blockdata;
